@@ -1,0 +1,97 @@
+{{- if .Values.enabled -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-redis-config
+  namespace: {{ .Release.Namespace }}
+data:
+  # `resolve-hostnames`/`announce-hostnames` MUST be set before `sentinel monitor`
+  # so the FQDN in the monitor line is accepted as-is. Without them Sentinel
+  # rejects hostnames (and we'd be back to hard-coding IPs that go stale on
+  # every pod reschedule).
+  sentinel.conf: |
+    sentinel resolve-hostnames yes
+    sentinel announce-hostnames yes
+    sentinel monitor {{ .Values.sentinel.masterName }} {{ .Release.Name }}-redis-0.{{ .Release.Name }}-redis.{{ .Release.Namespace }}.svc.cluster.local 6379 2
+    port 26379
+    sentinel down-after-milliseconds {{ .Values.sentinel.masterName }} 5000
+    sentinel failover-timeout {{ .Values.sentinel.masterName }} 60000
+    sentinel parallel-syncs {{ .Values.sentinel.masterName }} 1
+    sentinel auth-pass {{ .Values.sentinel.masterName }} {{ .Values.auth.password }}
+    sentinel sentinel-user default
+    sentinel sentinel-pass {{ .Values.auth.password }}
+
+  redis.sh: |
+    #!/bin/sh
+    set -e
+
+    PASSWORD=$REDIS_PASSWORD
+    MASTER_NAME=$REDIS_SENTINEL_MASTER_NAME
+    SERVICE_NAME={{ .Release.Name }}-redis
+    SENTINEL_SERVICE_NAME={{ .Release.Name }}-redis-sentinel
+    POD0_FQDN=$SERVICE_NAME-0.$SERVICE_NAME.{{ .Release.Namespace }}.svc.cluster.local
+    SELF_FQDN=$HOSTNAME.$SERVICE_NAME.{{ .Release.Namespace }}.svc.cluster.local
+
+    {{- if .Values.sentinel.enabled }}
+    # Resolve current master via Sentinel. With `announce-hostnames yes` set on
+    # every sentinel, `get-master-addr-by-name` returns a hostname rather than
+    # an IP — `--replicaof` then re-resolves DNS on every reconnect, surviving
+    # pod reschedules.
+    echo "Buscando maestro actual en $SENTINEL_SERVICE_NAME:26379..."
+    MASTER_HOST=$(redis-cli -h $SENTINEL_SERVICE_NAME -p 26379 --no-auth-warning sentinel get-master-addr-by-name $MASTER_NAME | head -n 1 || true)
+
+    # Defensive: if Sentinel hands back our own hostname (can happen during
+    # recovery when Sentinel's monitor target is the pod that's restarting),
+    # treat it as "no master" so we fall into the bootstrap branch.
+    if [ "$MASTER_HOST" = "$SELF_FQDN" ] || [ "$MASTER_HOST" = "$HOSTNAME" ]; then
+      echo "Sentinel devolvió self ($MASTER_HOST). Ignorando."
+      MASTER_HOST=""
+    fi
+
+    if [ -n "$MASTER_HOST" ] && [ "$MASTER_HOST" != "{" ] && ! echo "$MASTER_HOST" | grep -qE "Error|Could not"; then
+      echo "Maestro encontrado en $MASTER_HOST. Iniciando como réplica."
+      exec redis-server --replicaof $MASTER_HOST 6379 --requirepass "$PASSWORD" --masterauth "$PASSWORD" --protected-mode no
+    else
+      echo "No se encontró maestro via Sentinel."
+      if [ "$HOSTNAME" = "$SERVICE_NAME-0" ]; then
+        echo "Soy el pod 0. Iniciando como maestro."
+        exec redis-server --requirepass "$PASSWORD" --protected-mode no
+      else
+        echo "Iniciando como réplica del pod 0 por defecto."
+        exec redis-server --replicaof $POD0_FQDN 6379 --requirepass "$PASSWORD" --masterauth "$PASSWORD" --protected-mode no
+      fi
+    fi
+    {{- else }}
+    echo "Sentinel desactivado. Iniciando Redis en modo solitario..."
+    exec redis-server --requirepass "$PASSWORD" --protected-mode no
+    {{- end }}
+
+  sentinel.sh: |
+    #!/bin/sh
+    set -e
+
+    # Wait for the pod-0 FQDN to resolve before starting Sentinel. Sentinel
+    # itself re-resolves on every connect thanks to `resolve-hostnames yes`,
+    # but it rejects the initial `sentinel monitor` line if the hostname has
+    # never resolved.
+    POD0_FQDN={{ .Release.Name }}-redis-0.{{ .Release.Name }}-redis.{{ .Release.Namespace }}.svc.cluster.local
+    echo "Esperando resolución DNS para $POD0_FQDN..."
+    for i in $(seq 1 30); do
+      if getent hosts "$POD0_FQDN" >/dev/null 2>&1; then
+        echo "Pod-0 resuelve por DNS."
+        break
+      fi
+      echo "Esperando DNS... ($i/30)"
+      sleep 1
+    done
+    if ! getent hosts "$POD0_FQDN" >/dev/null 2>&1; then
+      echo "ERROR: $POD0_FQDN no resuelve tras 30 segundos."
+      exit 1
+    fi
+
+    cp /conf/sentinel.conf /tmp/sentinel.conf
+    sed -i 's/^[[:space:]]*//' /tmp/sentinel.conf
+
+    echo "Iniciando Redis en modo SENTINEL..."
+    exec redis-server /tmp/sentinel.conf --sentinel --protected-mode no
+{{- end -}}

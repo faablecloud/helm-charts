@@ -1,0 +1,16 @@
+{{- if and .Values.enabled .Values.sentinel.enabled -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-redis-sentinel
+  namespace: {{ .Release.Namespace }}
+spec:
+  ports:
+    - name: sentinel
+      port: 26379
+      targetPort: sentinel
+  selector:
+    app.kubernetes.io/name: redis-sentinel
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  type: ClusterIP
+{{- end -}}

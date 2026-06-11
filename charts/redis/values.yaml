@@ -1,0 +1,28 @@
+# Redis/Valkey chart values.
+# Consumed as a subchart: the parent maps its `redis:` subtree onto this root,
+# so a parent overrides these via `redis.<key>`.
+enabled: true
+
+image:
+  repository: redis
+  tag: 7-alpine
+
+auth:
+  # Password applied to both Redis (`requirepass`/`masterauth`) and Sentinel.
+  password: redis
+
+persistence:
+  enabled: true
+  size: 4Gi
+  # Empty string falls back to `global.defaultStorageClass`, then the cluster default.
+  storageClass: ""
+
+sentinel:
+  # false -> single standalone StatefulSet pod.
+  # true  -> StatefulSet with `replicaCount` redis pods + a Sentinel Deployment for HA failover.
+  enabled: false
+  replicaCount: 3
+  masterName: mymaster
+
+# `global:` is merged in from the parent chart by Helm; declared here for documentation.
+global: {}

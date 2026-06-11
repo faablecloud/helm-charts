@@ -1,0 +1,61 @@
+{{- if and .Values.enabled .Values.sentinel.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-redis-sentinel
+  namespace: {{ .Release.Namespace }}
+spec:
+  replicas: {{ .Values.sentinel.replicaCount }}
+  # Recreate (not RollingUpdate) on purpose: a rolling restart leaves old
+  # sentinels alive while new ones come up, and the new ones learn the stale
+  # master IP from the survivors via the `__sentinel__:hello` channel. Taking
+  # the whole quorum down at once forces sentinels to bootstrap from the
+  # ConfigMap (FQDN) instead of from peer state.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: redis-sentinel
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: redis-sentinel
+        app.kubernetes.io/instance: {{ .Release.Name }}
+      annotations:
+        # Force a rollout whenever the redis ConfigMap changes (k8s does not
+        # do this automatically). Without it, `sentinel.conf` / `sentinel.sh`
+        # edits land in the cluster but no pod picks them up.
+        checksum/config: {{ include (print $.Template.BasePath "/redis-configmap.yaml") . | sha256sum }}
+    spec:
+      containers:
+        - name: sentinel
+          image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
+          command: ["sh", "/conf/sentinel.sh"]
+          env:
+            - name: REDIS_PASSWORD
+              value: {{ .Values.auth.password | quote }}
+            - name: REDIS_SENTINEL_MASTER_NAME
+              value: {{ .Values.sentinel.masterName | quote }}
+          ports:
+            - name: sentinel
+              containerPort: 26379
+          volumeMounts:
+            - name: conf
+              mountPath: /conf
+          livenessProbe:
+            tcpSocket:
+              port: sentinel
+            initialDelaySeconds: 15
+            timeoutSeconds: 5
+          readinessProbe:
+            tcpSocket:
+              port: sentinel
+            initialDelaySeconds: 5
+            timeoutSeconds: 5
+      volumes:
+        - name: conf
+          configMap:
+            name: {{ .Release.Name }}-redis-config
+            defaultMode: 0755
+{{- end -}}

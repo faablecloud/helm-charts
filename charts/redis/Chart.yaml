@@ -1,0 +1,15 @@
+apiVersion: v2
+name: redis
+description: Redis/Valkey deployment for Faable services — standalone or Sentinel HA
+type: application
+version: 0.1.0
+appVersion: "7"
+home: https://faablecloud.github.io/helm-charts
+icon: https://faable.com/logo/Emblem.png
+maintainers:
+  - name: boyander
+keywords:
+  - redis
+  - valkey
+  - sentinel
+  - cache
