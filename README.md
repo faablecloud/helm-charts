@@ -9,9 +9,9 @@ You can then run `helm search repo faablecloud` to see the charts.
 
 ## Charts
 
-| Chart   | Description                                                       |
-| ------- | ----------------------------------------------------------------- |
-| `redis` | Redis/Valkey deployment — standalone or Sentinel HA. Shared by `auth` and `api`. |
+| Chart   | Description                                          |
+| ------- | ---------------------------------------------------- |
+| `redis` | Redis/Valkey deployment — standalone or Sentinel HA. |
 
 ## Releasing
 
