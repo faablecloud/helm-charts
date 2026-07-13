@@ -11,7 +11,22 @@ auth:
   # Password applied to both Redis (`requirepass`/`masterauth`) and Sentinel.
   password: redis
 
+# Container resources for the redis data pods. Empty = no requests/limits
+# (pods become BestEffort and can starve under node pressure — set these in
+# production; sentinel marks a node `+sdown` after `downAfterMilliseconds`
+# without a PING reply, and a CPU-starved redis blips past that easily).
+resources: {}
+
+# Memory ceiling for the dataset (e.g. "256mb"). Empty = unlimited (Redis
+# default). For cache-only workloads set it together with an eviction policy
+# so the instance can never OOM the pod.
+maxmemory: ""
+maxmemoryPolicy: allkeys-lru
+
 persistence:
+  # For cache-only datasets prefer `false`: it drops the PVC (which pins each
+  # replica to the node that holds its local volume) and disables RDB
+  # snapshots entirely (`save ""`).
   enabled: true
   size: 4Gi
   # Empty string falls back to `global.defaultStorageClass`, then the cluster default.
@@ -23,6 +38,11 @@ sentinel:
   enabled: false
   replicaCount: 3
   masterName: mymaster
+  # How long (ms) a master/replica must be unreachable before Sentinel flags
+  # it `+sdown`. Too low and short GC/IO/CPU blips cause sdown flapping.
+  downAfterMilliseconds: 10000
+  # Container resources for the sentinel pods.
+  resources: {}
 
 # `global:` is merged in from the parent chart by Helm; declared here for documentation.
 global: {}

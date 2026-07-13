@@ -14,12 +14,25 @@ data:
     sentinel announce-hostnames yes
     sentinel monitor {{ .Values.sentinel.masterName }} {{ .Release.Name }}-redis-0.{{ .Release.Name }}-redis.{{ .Release.Namespace }}.svc.cluster.local 6379 2
     port 26379
-    sentinel down-after-milliseconds {{ .Values.sentinel.masterName }} 5000
+    sentinel down-after-milliseconds {{ .Values.sentinel.masterName }} {{ .Values.sentinel.downAfterMilliseconds }}
     sentinel failover-timeout {{ .Values.sentinel.masterName }} 60000
     sentinel parallel-syncs {{ .Values.sentinel.masterName }} 1
     sentinel auth-pass {{ .Values.sentinel.masterName }} {{ .Values.auth.password }}
     sentinel sentinel-user default
     sentinel sentinel-pass {{ .Values.auth.password }}
+
+  # Tuning that belongs in a config file rather than CLI flags (an empty
+  # `save ""` can't survive shell word-splitting as an argument). Flags passed
+  # on the redis-server command line still override anything set here.
+  redis.conf: |
+    {{- if .Values.maxmemory }}
+    maxmemory {{ .Values.maxmemory }}
+    maxmemory-policy {{ .Values.maxmemoryPolicy }}
+    {{- end }}
+    {{- if not .Values.persistence.enabled }}
+    # Cache-only: no PVC behind /data, so don't bother snapshotting to it.
+    save ""
+    {{- end }}
 
   redis.sh: |
     #!/bin/sh
@@ -50,20 +63,20 @@ data:
 
     if [ -n "$MASTER_HOST" ] && [ "$MASTER_HOST" != "{" ] && ! echo "$MASTER_HOST" | grep -qE "Error|Could not"; then
       echo "Maestro encontrado en $MASTER_HOST. Iniciando como réplica."
-      exec redis-server --replicaof $MASTER_HOST 6379 --requirepass "$PASSWORD" --masterauth "$PASSWORD" --protected-mode no
+      exec redis-server /conf/redis.conf --replicaof $MASTER_HOST 6379 --requirepass "$PASSWORD" --masterauth "$PASSWORD" --protected-mode no
     else
       echo "No se encontró maestro via Sentinel."
       if [ "$HOSTNAME" = "$SERVICE_NAME-0" ]; then
         echo "Soy el pod 0. Iniciando como maestro."
-        exec redis-server --requirepass "$PASSWORD" --protected-mode no
+        exec redis-server /conf/redis.conf --requirepass "$PASSWORD" --protected-mode no
       else
         echo "Iniciando como réplica del pod 0 por defecto."
-        exec redis-server --replicaof $POD0_FQDN 6379 --requirepass "$PASSWORD" --masterauth "$PASSWORD" --protected-mode no
+        exec redis-server /conf/redis.conf --replicaof $POD0_FQDN 6379 --requirepass "$PASSWORD" --masterauth "$PASSWORD" --protected-mode no
       fi
     fi
     {{- else }}
     echo "Sentinel desactivado. Iniciando Redis en modo solitario..."
-    exec redis-server --requirepass "$PASSWORD" --protected-mode no
+    exec redis-server /conf/redis.conf --requirepass "$PASSWORD" --protected-mode no
     {{- end }}
 
   sentinel.sh: |

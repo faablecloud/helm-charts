@@ -16,6 +16,10 @@ spec:
       labels:
         app.kubernetes.io/name: redis
         app.kubernetes.io/instance: {{ .Release.Name }}
+      annotations:
+        # Roll the data pods whenever the redis ConfigMap changes (redis.conf /
+        # redis.sh edits are otherwise never picked up).
+        checksum/config: {{ include (print $.Template.BasePath "/redis-configmap.yaml") . | sha256sum }}
     spec:
       containers:
         - name: redis
@@ -44,13 +48,20 @@ spec:
               port: redis
             initialDelaySeconds: 5
             timeoutSeconds: 5
-
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
 
       volumes:
         - name: conf
           configMap:
             name: {{ .Release.Name }}-redis-config
             defaultMode: 0755
+        {{- if not .Values.persistence.enabled }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
 
   {{- if .Values.persistence.enabled }}
   volumeClaimTemplates:
@@ -64,9 +75,5 @@ spec:
         resources:
           requests:
             storage: {{ .Values.persistence.size | quote }}
-  {{- else }}
-  volumes:
-    - name: data
-      emptyDir: {}
   {{- end }}
 {{- end -}}

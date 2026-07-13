@@ -53,6 +53,10 @@ spec:
               port: sentinel
             initialDelaySeconds: 5
             timeoutSeconds: 5
+          {{- with .Values.sentinel.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
       volumes:
         - name: conf
           configMap:
