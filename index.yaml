@@ -3,6 +3,26 @@ entries:
   redis:
   - apiVersion: v2
     appVersion: "7"
+    created: "2026-07-23T17:56:09.328523092Z"
+    description: Redis/Valkey deployment for Faable services — standalone or Sentinel
+      HA
+    digest: 914d93d2151cfd7cfcf52ae326ebd7d5a7e4e5cf264a7d0ca4d3c79d21d810c9
+    home: https://faablecloud.github.io/helm-charts
+    icon: https://faable.com/logo/Emblem.png
+    keywords:
+    - redis
+    - valkey
+    - sentinel
+    - cache
+    maintainers:
+    - name: boyander
+    name: redis
+    type: application
+    urls:
+    - https://github.com/faablecloud/helm-charts/releases/download/redis-0.3.0/redis-0.3.0.tgz
+    version: 0.3.0
+  - apiVersion: v2
+    appVersion: "7"
     created: "2026-07-13T09:44:01.053616297Z"
     description: Redis/Valkey deployment for Faable services — standalone or Sentinel
       HA
@@ -41,4 +61,4 @@ entries:
     urls:
     - https://github.com/faablecloud/helm-charts/releases/download/redis-0.1.0/redis-0.1.0.tgz
     version: 0.1.0
-generated: "2026-07-13T09:44:01.053629522Z"
+generated: "2026-07-23T17:56:09.328582451Z"
