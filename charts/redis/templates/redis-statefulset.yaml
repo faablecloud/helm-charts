@@ -21,6 +21,10 @@ spec:
         # redis.sh edits are otherwise never picked up).
         checksum/config: {{ include (print $.Template.BasePath "/redis-configmap.yaml") . | sha256sum }}
     spec:
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: redis
           image: {{ .Values.image.repository }}:{{ .Values.image.tag }}

@@ -28,6 +28,10 @@ spec:
         # edits land in the cluster but no pod picks them up.
         checksum/config: {{ include (print $.Template.BasePath "/redis-configmap.yaml") . | sha256sum }}
     spec:
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: sentinel
           image: {{ .Values.image.repository }}:{{ .Values.image.tag }}

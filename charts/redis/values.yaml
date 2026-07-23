@@ -46,3 +46,8 @@ sentinel:
 
 # `global:` is merged in from the parent chart by Helm; declared here for documentation.
 global: {}
+
+# Affinity opcional aplicada al StatefulSet de redis y al Deployment de
+# sentinel. Vacia por defecto (sin cambio de comportamiento); los consumidores
+# la definen via values (ej. nodeAffinity anti control-plane en faablecore).
+affinity: {}
