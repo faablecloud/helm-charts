@@ -6,6 +6,7 @@ metadata:
   namespace: {{ .Release.Namespace }}
 spec:
   replicas: {{ .Values.sentinel.replicaCount }}
+  revisionHistoryLimit: {{ .Values.sentinel.revisionHistoryLimit | default 3 }}
   # Recreate (not RollingUpdate) on purpose: a rolling restart leaves old
   # sentinels alive while new ones come up, and the new ones learn the stale
   # master IP from the survivors via the `__sentinel__:hello` channel. Taking

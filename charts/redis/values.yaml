@@ -17,6 +17,11 @@ auth:
 # without a PING reply, and a CPU-starved redis blips past that easily).
 resources: {}
 
+# Cuántas revisiones paradas guarda k8s. El default de Kubernetes es 10, pero
+# ECR sólo conserva las últimas imágenes de cada repo: el historial de más
+# atrás apunta a imágenes borradas y el rollback muere en ImagePullBackOff.
+revisionHistoryLimit: 3
+
 # Memory ceiling for the dataset (e.g. "256mb"). Empty = unlimited (Redis
 # default). For cache-only workloads set it together with an eviction policy
 # so the instance can never OOM the pod.
@@ -41,6 +46,7 @@ sentinel:
   # How long (ms) a master/replica must be unreachable before Sentinel flags
   # it `+sdown`. Too low and short GC/IO/CPU blips cause sdown flapping.
   downAfterMilliseconds: 10000
+  revisionHistoryLimit: 3
   # Container resources for the sentinel pods.
   resources: {}
 

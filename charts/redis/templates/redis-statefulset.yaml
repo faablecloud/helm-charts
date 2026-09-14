@@ -7,6 +7,7 @@ metadata:
 spec:
   serviceName: {{ .Release.Name }}-redis
   replicas: {{ .Values.sentinel.enabled | ternary .Values.sentinel.replicaCount 1 }}
+  revisionHistoryLimit: {{ .Values.revisionHistoryLimit | default 3 }}
   selector:
     matchLabels:
       app.kubernetes.io/name: redis
