@@ -68,7 +68,11 @@ data:
       echo "No se encontró maestro via Sentinel."
       if [ "$HOSTNAME" = "$SERVICE_NAME-0" ]; then
         echo "Soy el pod 0. Iniciando como maestro."
-        exec redis-server /conf/redis.conf --requirepass "$PASSWORD" --protected-mode no
+        # `--masterauth` also on the master: after a failover Sentinel demotes
+        # this pod to replica with REPLICAOF, which keeps the running config.
+        # Without it the demoted pod loops on NOAUTH against the new master
+        # forever (~350 conn/s) and HA silently drops to a single replica.
+        exec redis-server /conf/redis.conf --requirepass "$PASSWORD" --masterauth "$PASSWORD" --protected-mode no
       else
         echo "Iniciando como réplica del pod 0 por defecto."
         exec redis-server /conf/redis.conf --replicaof $POD0_FQDN 6379 --requirepass "$PASSWORD" --masterauth "$PASSWORD" --protected-mode no
@@ -76,7 +80,7 @@ data:
     fi
     {{- else }}
     echo "Sentinel desactivado. Iniciando Redis en modo solitario..."
-    exec redis-server /conf/redis.conf --requirepass "$PASSWORD" --protected-mode no
+    exec redis-server /conf/redis.conf --requirepass "$PASSWORD" --masterauth "$PASSWORD" --protected-mode no
     {{- end }}
 
   sentinel.sh: |
