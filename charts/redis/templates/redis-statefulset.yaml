@@ -8,6 +8,12 @@ spec:
   serviceName: {{ .Release.Name }}-redis
   replicas: {{ .Values.sentinel.enabled | ternary .Values.sentinel.replicaCount 1 }}
   revisionHistoryLimit: {{ .Values.revisionHistoryLimit | default 3 }}
+  {{- if .Values.sentinel.enabled }}
+  # Let Sentinel INFO each restarted replica (every 10 s) before the rollout
+  # moves on: the last pods to roll can be the master, and its failover needs
+  # a replica Sentinel already considers good.
+  minReadySeconds: {{ .Values.sentinel.minReadySeconds }}
+  {{- end }}
   selector:
     matchLabels:
       app.kubernetes.io/name: redis
@@ -18,14 +24,12 @@ spec:
         app.kubernetes.io/name: redis
         app.kubernetes.io/instance: {{ .Release.Name }}
       annotations:
-        # Roll the data pods whenever the redis ConfigMap changes (redis.conf /
-        # redis.sh edits are otherwise never picked up).
-        checksum/config: {{ include (print $.Template.BasePath "/redis-configmap.yaml") . | sha256sum }}
+        # Roll the data pods when redis.conf / redis.sh change — and ONLY
+        # then: sentinel.conf / sentinel.sh edits must not restart the data
+        # pods (see "redis.checksum" in _helpers.tpl).
+        checksum/config: {{ include "redis.checksum" (list $ "redis.conf" "redis.sh") }}
     spec:
-      {{- with .Values.affinity }}
-      affinity:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+      {{- include "redis.affinity" (list $ "redis" (.Values.sentinel.enabled | ternary .Values.podAntiAffinity.redis "")) | nindent 6 }}
       containers:
         - name: redis
           image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
@@ -43,6 +47,13 @@ spec:
               mountPath: /data
             - name: conf
               mountPath: /conf
+          # redis.sh may wait up to `sentinel.startupWaitSeconds` for a peer to
+          # be promoted before it listens; liveness must not kill it meanwhile.
+          startupProbe:
+            tcpSocket:
+              port: redis
+            periodSeconds: 5
+            failureThreshold: {{ add 12 (div .Values.sentinel.startupWaitSeconds 5) }}
           livenessProbe:
             tcpSocket:
               port: redis

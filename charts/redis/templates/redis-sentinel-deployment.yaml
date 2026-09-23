@@ -24,15 +24,12 @@ spec:
         app.kubernetes.io/name: redis-sentinel
         app.kubernetes.io/instance: {{ .Release.Name }}
       annotations:
-        # Force a rollout whenever the redis ConfigMap changes (k8s does not
-        # do this automatically). Without it, `sentinel.conf` / `sentinel.sh`
-        # edits land in the cluster but no pod picks them up.
-        checksum/config: {{ include (print $.Template.BasePath "/redis-configmap.yaml") . | sha256sum }}
+        # Roll the sentinels when sentinel.conf / sentinel.sh change — and
+        # ONLY then: a redis.conf / redis.sh edit must not take the whole
+        # quorum down while the StatefulSet is restarting the master.
+        checksum/config: {{ include "redis.checksum" (list $ "sentinel.conf" "sentinel.sh") }}
     spec:
-      {{- with .Values.affinity }}
-      affinity:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+      {{- include "redis.affinity" (list $ "redis-sentinel" .Values.podAntiAffinity.sentinel) | nindent 6 }}
       containers:
         - name: sentinel
           image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
@@ -48,6 +45,13 @@ spec:
           volumeMounts:
             - name: conf
               mountPath: /conf
+          # sentinel.sh may wait `sentinel.promoteAfterSeconds` (plus DNS) for
+          # the master before it listens.
+          startupProbe:
+            tcpSocket:
+              port: sentinel
+            periodSeconds: 5
+            failureThreshold: {{ add 12 (div .Values.sentinel.promoteAfterSeconds 5) }}
           livenessProbe:
             tcpSocket:
               port: sentinel

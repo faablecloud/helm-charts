@@ -12,7 +12,15 @@ spec:
   selector:
     app.kubernetes.io/name: redis
     app.kubernetes.io/instance: {{ .Release.Name }}
-  publishNotReadyAddresses: true
+  # false on purpose: a restarted master must NOT resolve (to its new IP)
+  # until it listens. While its FQDN resolved to the new pod, Sentinel —
+  # which keeps the old IP — saw every replica "following another master"
+  # and fired +fix-slave-config each second; that REPLICAOF comes with a
+  # CLIENT KILL that drops Sentinel's own links to the replicas, so the
+  # failover found no good replica and waited 2 x failover-timeout to retry.
+  # (sentinel.c: sentinelAddrEqualsHostname falls back to comparing names
+  # when the name does not resolve.)
+  publishNotReadyAddresses: false
   clusterIP: None
   type: ClusterIP
 {{- end -}}

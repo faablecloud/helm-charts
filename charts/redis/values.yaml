@@ -46,6 +46,20 @@ sentinel:
   # How long (ms) a master/replica must be unreachable before Sentinel flags
   # it `+sdown`. Too low and short GC/IO/CPU blips cause sdown flapping.
   downAfterMilliseconds: 10000
+  # redis.sh: how long a restarting pod waits for a peer to be promoted
+  # (instead of starting as an empty master) while other redis pods are alive.
+  # Must exceed downAfterMilliseconds + one aborted failover's retry delay
+  # (2 x failoverTimeout).
+  startupWaitSeconds: 75
+  # sentinel.sh: with no live master but live replicas (master restarted
+  # together with the sentinels), how long to wait before promoting the most
+  # up-to-date replica itself. Keep it well below startupWaitSeconds.
+  promoteAfterSeconds: 15
+  # Sentinel's failover-timeout (ms). A failover that aborts is not retried
+  # before 2x this, so it bounds how long a master can stay down.
+  failoverTimeout: 30000
+  # StatefulSet minReadySeconds in Sentinel mode (see redis-statefulset.yaml).
+  minReadySeconds: 15
   revisionHistoryLimit: 3
   # Container resources for the sentinel pods.
   resources: {}
@@ -57,3 +71,16 @@ global: {}
 # sentinel. Vacia por defecto (sin cambio de comportamiento); los consumidores
 # la definen via values (ej. nodeAffinity anti control-plane en faablecore).
 affinity: {}
+
+# podAntiAffinity por hostname entre pods del mismo componente, añadida a
+# `affinity`. hard = required (nunca dos en el mismo nodo; un pod se queda
+# Pending si no hay nodo libre), soft = preferred, "" = sin anti-afinidad.
+# Solo aplica con sentinel.enabled (en standalone hay un único pod).
+podAntiAffinity:
+  redis: hard
+  sentinel: soft
+
+# PodDisruptionBudget (maxUnavailable: 1) para los redis y los sentinels, para
+# que un drain no se lleve dos a la vez. Solo con sentinel.enabled.
+pdb:
+  enabled: true

@@ -15,7 +15,7 @@ data:
     sentinel monitor {{ .Values.sentinel.masterName }} {{ .Release.Name }}-redis-0.{{ .Release.Name }}-redis.{{ .Release.Namespace }}.svc.cluster.local 6379 2
     port 26379
     sentinel down-after-milliseconds {{ .Values.sentinel.masterName }} {{ .Values.sentinel.downAfterMilliseconds }}
-    sentinel failover-timeout {{ .Values.sentinel.masterName }} 60000
+    sentinel failover-timeout {{ .Values.sentinel.masterName }} {{ .Values.sentinel.failoverTimeout }}
     sentinel parallel-syncs {{ .Values.sentinel.masterName }} 1
     sentinel auth-pass {{ .Values.sentinel.masterName }} {{ .Values.auth.password }}
     sentinel sentinel-user default
@@ -42,73 +42,230 @@ data:
     MASTER_NAME=$REDIS_SENTINEL_MASTER_NAME
     SERVICE_NAME={{ .Release.Name }}-redis
     SENTINEL_SERVICE_NAME={{ .Release.Name }}-redis-sentinel
-    POD0_FQDN=$SERVICE_NAME-0.$SERVICE_NAME.{{ .Release.Namespace }}.svc.cluster.local
-    SELF_FQDN=$HOSTNAME.$SERVICE_NAME.{{ .Release.Namespace }}.svc.cluster.local
+    DOMAIN=$SERVICE_NAME.{{ .Release.Namespace }}.svc.cluster.local
+    REPLICAS={{ .Values.sentinel.replicaCount }}
+    POD0_FQDN=$SERVICE_NAME-0.$DOMAIN
+    SELF_FQDN=$HOSTNAME.$DOMAIN
+    SELF_IP=$(hostname -i 2>/dev/null | awk '{print $1}')
+    ANNOUNCE=""
+    {{- if .Values.sentinel.enabled }}
+    # Announce the pod FQDN instead of the pod IP: every restart changes the
+    # IP, so Sentinel saw a NEW replica each time (ghost `s_down` entries for
+    # the old IPs) and did not know the restarted one until the master's next
+    # INFO — too late when the master is the next pod to roll, so the
+    # failover aborted with `no-good-slave`.
+    ANNOUNCE="--replica-announce-ip $SELF_FQDN"
+    {{- end }}
+
+    # `--masterauth` also on the master: after a failover Sentinel demotes a
+    # master to replica with REPLICAOF, which keeps the running config.
+    # Without it the demoted pod loops on NOAUTH against the new master
+    # forever (~350 conn/s) and HA silently drops to a single replica.
+    start_master() {
+      echo "$1 Iniciando como maestro."
+      exec redis-server /conf/redis.conf --requirepass "$PASSWORD" --masterauth "$PASSWORD" --protected-mode no $ANNOUNCE
+    }
+    start_replica() {
+      echo "$2 Iniciando como réplica de $1."
+      exec redis-server /conf/redis.conf --replicaof "$1" 6379 --requirepass "$PASSWORD" --masterauth "$PASSWORD" --protected-mode no $ANNOUNCE
+    }
 
     {{- if .Values.sentinel.enabled }}
-    # Resolve current master via Sentinel. With `announce-hostnames yes` set on
-    # every sentinel, `get-master-addr-by-name` returns a hostname rather than
-    # an IP — `--replicaof` then re-resolves DNS on every reconnect, surviving
-    # pod reschedules.
-    echo "Buscando maestro actual en $SENTINEL_SERVICE_NAME:26379..."
-    MASTER_HOST=$(redis-cli -h $SENTINEL_SERVICE_NAME -p 26379 --no-auth-warning sentinel get-master-addr-by-name $MASTER_NAME | head -n 1 || true)
+    is_self() {
+      [ "$1" = "$SELF_FQDN" ] && return 0
+      [ "$1" = "$HOSTNAME" ] && return 0
+      [ -n "$SELF_IP" ] && [ "$1" = "$SELF_IP" ] && return 0
+      return 1
+    }
 
-    # Defensive: if Sentinel hands back our own hostname (can happen during
-    # recovery when Sentinel's monitor target is the pod that's restarting),
-    # treat it as "no master" so we fall into the bootstrap branch.
-    if [ "$MASTER_HOST" = "$SELF_FQDN" ] || [ "$MASTER_HOST" = "$HOSTNAME" ]; then
-      echo "Sentinel devolvió self ($MASTER_HOST). Ignorando."
-      MASTER_HOST=""
-    fi
+    # With `announce-hostnames yes` on every sentinel this returns a hostname,
+    # so `--replicaof` re-resolves DNS on every reconnect.
+    sentinel_master() {
+      timeout 3 redis-cli -h "$SENTINEL_SERVICE_NAME" -p 26379 --no-auth-warning \
+        sentinel get-master-addr-by-name "$MASTER_NAME" 2>/dev/null \
+        | head -n 1 | tr -d '\r' | grep -vE '^$|^\{|Error|Could not|ERR' || true
+    }
 
-    if [ -n "$MASTER_HOST" ] && [ "$MASTER_HOST" != "{" ] && ! echo "$MASTER_HOST" | grep -qE "Error|Could not"; then
-      echo "Maestro encontrado en $MASTER_HOST. Iniciando como réplica."
-      exec redis-server /conf/redis.conf --replicaof $MASTER_HOST 6379 --requirepass "$PASSWORD" --masterauth "$PASSWORD" --protected-mode no
-    else
-      echo "No se encontró maestro via Sentinel."
-      if [ "$HOSTNAME" = "$SERVICE_NAME-0" ]; then
-        echo "Soy el pod 0. Iniciando como maestro."
-        # `--masterauth` also on the master: after a failover Sentinel demotes
-        # this pod to replica with REPLICAOF, which keeps the running config.
-        # Without it the demoted pod loops on NOAUTH against the new master
-        # forever (~350 conn/s) and HA silently drops to a single replica.
-        exec redis-server /conf/redis.conf --requirepass "$PASSWORD" --masterauth "$PASSWORD" --protected-mode no
-      else
-        echo "Iniciando como réplica del pod 0 por defecto."
-        exec redis-server /conf/redis.conf --replicaof $POD0_FQDN 6379 --requirepass "$PASSWORD" --masterauth "$PASSWORD" --protected-mode no
+    # Ask the other redis pods directly. Sets PEER_MASTER (a live master),
+    # PEER_REPLICAS (reachable replicas), PEERS_WITH_DATA (replicas that have
+    # replicated something since they started: offset > 0) and
+    # PEERS_FOLLOW_SELF (replicas whose master is this pod).
+    scan_peers() {
+      PEER_MASTER=""; PEER_REPLICAS=0; PEERS_WITH_DATA=0; PEERS_FOLLOW_SELF=0
+      i=0
+      while [ "$i" -lt "$REPLICAS" ]; do
+        if [ "$SERVICE_NAME-$i" != "$HOSTNAME" ]; then
+          h=$SERVICE_NAME-$i.$DOMAIN
+          info=$(timeout 3 redis-cli -h "$h" -a "$PASSWORD" --no-auth-warning info replication 2>/dev/null | tr -d '\r' || true)
+          case "$info" in
+            *role:master*) PEER_MASTER=$h ;;
+            *role:slave*)
+              PEER_REPLICAS=$((PEER_REPLICAS + 1))
+              if [ "$(echo "$info" | sed -n 's/^master_repl_offset://p')" != "0" ]; then
+                PEERS_WITH_DATA=$((PEERS_WITH_DATA + 1))
+              fi
+              if is_self "$(echo "$info" | sed -n 's/^master_host://p')"; then
+                PEERS_FOLLOW_SELF=$((PEERS_FOLLOW_SELF + 1))
+              fi
+              ;;
+          esac
+        fi
+        i=$((i + 1))
+      done
+    }
+
+    # Never start as an empty master while a peer holds the data. If Sentinel
+    # still names this pod (it was the master and is restarting) or cannot
+    # answer (sentinels restarting too), wait for a peer to be promoted —
+    # by Sentinel's failover, or by sentinel.sh when no sentinel remembers
+    # the replicas. Starting as master here is what wiped the cache-only
+    # releases on every config change.
+    DEADLINE=$(( $(date +%s) + {{ .Values.sentinel.startupWaitSeconds }} ))
+    while :; do
+      MASTER_HOST=$(sentinel_master)
+      if [ -n "$MASTER_HOST" ] && ! is_self "$MASTER_HOST"; then
+        start_replica "$MASTER_HOST" "Sentinel señala el maestro."
       fi
+      scan_peers
+      if [ -n "$PEER_MASTER" ]; then
+        start_replica "$PEER_MASTER" "Un par es maestro."
+      fi
+      if [ "$PEER_REPLICAS" -eq 0 ]; then
+        echo "Ningún par responde: arranque en frío."
+        break
+      fi
+      if [ "$PEERS_WITH_DATA" -eq 0 ]; then
+        # Every live replica restarted too and never synced: there is no
+        # data to protect by waiting (and a pod with persistence may be the
+        # one holding it on disk).
+        echo "Ninguna réplica viva ha replicado nada: arranque en frío."
+        break
+      fi
+      if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+        echo "Sin maestro tras {{ .Values.sentinel.startupWaitSeconds }}s (sentinel=${MASTER_HOST:-none}, réplicas=$PEER_REPLICAS)."
+        break
+      fi
+      echo "Sin maestro todavía (sentinel=${MASTER_HOST:-none}, réplicas vivas=$PEER_REPLICAS). Esperando la promoción..."
+      sleep 2
+    done
+
+    if [ "$HOSTNAME" = "$SERVICE_NAME-0" ] || [ "$PEERS_FOLLOW_SELF" -gt 0 ]; then
+      start_master "Bootstrap."
     fi
+    start_replica "$POD0_FQDN" "Bootstrap."
     {{- else }}
-    echo "Sentinel desactivado. Iniciando Redis en modo solitario..."
-    exec redis-server /conf/redis.conf --requirepass "$PASSWORD" --masterauth "$PASSWORD" --protected-mode no
+    start_master "Sentinel desactivado, modo solitario."
     {{- end }}
 
   sentinel.sh: |
     #!/bin/sh
     set -e
 
-    # Wait for the pod-0 FQDN to resolve before starting Sentinel. Sentinel
-    # itself re-resolves on every connect thanks to `resolve-hostnames yes`,
-    # but it rejects the initial `sentinel monitor` line if the hostname has
-    # never resolved.
-    POD0_FQDN={{ .Release.Name }}-redis-0.{{ .Release.Name }}-redis.{{ .Release.Namespace }}.svc.cluster.local
-    echo "Esperando resolución DNS para $POD0_FQDN..."
-    for i in $(seq 1 30); do
-      if getent hosts "$POD0_FQDN" >/dev/null 2>&1; then
-        echo "Pod-0 resuelve por DNS."
+    PASSWORD=$REDIS_PASSWORD
+    MASTER_NAME=$REDIS_SENTINEL_MASTER_NAME
+    SERVICE_NAME={{ .Release.Name }}-redis
+    DOMAIN=$SERVICE_NAME.{{ .Release.Namespace }}.svc.cluster.local
+    REPLICAS={{ .Values.sentinel.replicaCount }}
+    POD0_FQDN=$SERVICE_NAME-0.$DOMAIN
+
+    rcli() {
+      h=$1; shift
+      timeout 3 redis-cli -h "$h" -a "$PASSWORD" --no-auth-warning "$@" 2>/dev/null | tr -d '\r'
+    }
+
+    # A sentinel that starts from the ConfigMap has no memory: monitoring
+    # pod-0 blindly made it follow a replica, and Sentinel only learns the
+    # replicas from the master's INFO, so it could not fail anything over.
+    # Find the real master among the redis pods instead. Sets MASTER (live
+    # master with most replicas), CAND (replica with the highest offset),
+    # REPLICA_HOSTS and LINKS_UP (replicas that still see their master).
+    discover() {
+      MASTER=""; BEST=-1; CAND=""; CAND_OFF=-1; REPLICA_HOSTS=""; LINKS_UP=0
+      i=0
+      while [ "$i" -lt "$REPLICAS" ]; do
+        h=$SERVICE_NAME-$i.$DOMAIN
+        info=$(rcli "$h" info replication || true)
+        case "$info" in
+          *role:master*)
+            n=$(echo "$info" | sed -n 's/^connected_slaves://p')
+            if [ "${n:-0}" -gt "$BEST" ]; then BEST=${n:-0}; MASTER=$h; fi
+            ;;
+          *role:slave*)
+            REPLICA_HOSTS="$REPLICA_HOSTS $h"
+            off=$(echo "$info" | sed -n 's/^master_repl_offset://p')
+            if [ "${off:-0}" -gt "$CAND_OFF" ]; then CAND_OFF=${off:-0}; CAND=$h; fi
+            case "$info" in *master_link_status:up*) LINKS_UP=$((LINKS_UP + 1)) ;; esac
+            ;;
+        esac
+        i=$((i + 1))
+      done
+    }
+
+    # No live master but live replicas = the master was restarted at the same
+    # time as the sentinels, and no sentinel remembers the replicas. Wait a
+    # little for it to reappear; then promote the most up-to-date replica
+    # ourselves. The choice is deterministic (highest offset, lowest ordinal
+    # on a tie), so sentinels starting together pick the same one, and
+    # REPLICAOF is idempotent. Never while a replica still sees a master
+    # (that would be a split brain, not a dead master).
+    DEADLINE=$(( $(date +%s) + {{ .Values.sentinel.promoteAfterSeconds }} ))
+    while :; do
+      discover
+      if [ -n "$MASTER" ]; then
+        echo "Maestro vivo: $MASTER ($BEST réplicas)."
         break
       fi
-      echo "Esperando DNS... ($i/30)"
+      if [ -z "$REPLICA_HOSTS" ]; then
+        echo "Ningún redis responde: arranque en frío, monitorizo $POD0_FQDN."
+        break
+      fi
+      if [ "$LINKS_UP" -eq 0 ] && [ "$(date +%s)" -ge "$DEADLINE" ]; then
+        echo "Ningún maestro vivo tras {{ .Values.sentinel.promoteAfterSeconds }}s: promuevo $CAND (offset $CAND_OFF)."
+        rcli "$CAND" replicaof no one >/dev/null
+        for r in $REPLICA_HOSTS; do
+          [ "$r" = "$CAND" ] || rcli "$r" replicaof "$CAND" 6379 >/dev/null
+        done
+        MASTER=$CAND
+        break
+      fi
+      echo "Sin maestro vivo (réplicas:$REPLICA_HOSTS, enlaces up=$LINKS_UP). Reintentando..."
+      sleep 2
+    done
+    TARGET=${MASTER:-$POD0_FQDN}
+
+    # Sentinel rejects the `sentinel monitor` line if the hostname has never
+    # resolved (it re-resolves on every connect afterwards thanks to
+    # `resolve-hostnames yes`).
+    echo "Esperando resolución DNS para $TARGET..."
+    for i in $(seq 1 30); do
+      if getent hosts "$TARGET" >/dev/null 2>&1; then
+        break
+      fi
       sleep 1
     done
-    if ! getent hosts "$POD0_FQDN" >/dev/null 2>&1; then
-      echo "ERROR: $POD0_FQDN no resuelve tras 30 segundos."
+    if ! getent hosts "$TARGET" >/dev/null 2>&1; then
+      echo "ERROR: $TARGET no resuelve tras 30 segundos."
       exit 1
     fi
 
     cp /conf/sentinel.conf /tmp/sentinel.conf
     sed -i 's/^[[:space:]]*//' /tmp/sentinel.conf
+    sed -i -E "s/^(sentinel monitor [^ ]+ )[^ ]+( .*)$/\1$TARGET\2/" /tmp/sentinel.conf
 
-    echo "Iniciando Redis en modo SENTINEL..."
+    # Declare every other redis pod as a replica right away, by the same FQDN
+    # it announces: a fresh sentinel otherwise only learns them from the
+    # master's INFO, and a failover in the meantime aborts with no-good-slave.
+    # Only names that resolve now — Sentinel refuses to start on one that
+    # does not.
+    i=0
+    while [ "$i" -lt "$REPLICAS" ]; do
+      h=$SERVICE_NAME-$i.$DOMAIN
+      if [ "$h" != "$TARGET" ] && getent hosts "$h" >/dev/null 2>&1; then
+        echo "sentinel known-replica $MASTER_NAME $h 6379" >> /tmp/sentinel.conf
+      fi
+      i=$((i + 1))
+    done
+
+    echo "Iniciando Redis en modo SENTINEL (maestro $TARGET)..."
     exec redis-server /tmp/sentinel.conf --sentinel --protected-mode no
 {{- end -}}
