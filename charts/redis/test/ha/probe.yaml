@@ -1,0 +1,30 @@
+# Write probe: every 0.5 s asks Sentinel for the master, writes a key there and
+# reads DBSIZE. One line per attempt: "<time> OK|FAIL m=<master> dbsize=<n>".
+# __REL__ and __PASS__ are replaced by lib.sh.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: probe
+spec:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: node-role.kubernetes.io/control-plane
+                operator: DoesNotExist
+  containers:
+    - name: probe
+      image: redis:7-alpine
+      command: ["sh", "-c"]
+      args:
+        - |
+          while :; do
+            t=$(date +%H:%M:%S)
+            m=$(timeout 2 redis-cli -h __REL__-redis-sentinel -p 26379 sentinel get-master-addr-by-name mymaster 2>/dev/null | head -1)
+            r=$(timeout 2 redis-cli -h "${m:-none}" -a __PASS__ --no-auth-warning set probe "$t" 2>&1 | head -1)
+            d=$(timeout 2 redis-cli -h "${m:-none}" -a __PASS__ --no-auth-warning dbsize 2>&1 | head -1)
+            [ "$r" = "OK" ] && s=OK || s=FAIL
+            echo "$t $s m=${m:-none} dbsize=$d"
+            sleep 0.5
+          done
