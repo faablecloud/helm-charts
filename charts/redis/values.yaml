@@ -17,9 +17,9 @@ auth:
 # without a PING reply, and a CPU-starved redis blips past that easily).
 resources: {}
 
-# Cuántas revisiones paradas guarda k8s. El default de Kubernetes es 10, pero
-# ECR sólo conserva las últimas imágenes de cada repo: el historial de más
-# atrás apunta a imágenes borradas y el rollback muere en ImagePullBackOff.
+# How many stopped revisions Kubernetes keeps. Its default is 10, but a registry
+# that only retains recent images leaves older revisions pointing at deleted
+# images, and a rollback to one dies in ImagePullBackOff.
 revisionHistoryLimit: 3
 
 # Memory ceiling for the dataset (e.g. "256mb"). Empty = unlimited (Redis
@@ -67,20 +67,20 @@ sentinel:
 # `global:` is merged in from the parent chart by Helm; declared here for documentation.
 global: {}
 
-# Affinity opcional aplicada al StatefulSet de redis y al Deployment de
-# sentinel. Vacia por defecto (sin cambio de comportamiento); los consumidores
-# la definen via values (ej. nodeAffinity anti control-plane en faablecore).
+# Optional affinity for the redis StatefulSet and the sentinel Deployment. Empty
+# by default (no change in behaviour); set it through values, for example a
+# nodeAffinity that keeps the pods off control-plane nodes.
 affinity: {}
 
-# podAntiAffinity por hostname entre pods del mismo componente, añadida a
-# `affinity`. hard = required (nunca dos en el mismo nodo; un pod se queda
-# Pending si no hay nodo libre), soft = preferred, "" = sin anti-afinidad.
-# Solo aplica con sentinel.enabled (en standalone hay un único pod).
+# podAntiAffinity by hostname between pods of the same component, added to
+# `affinity`. hard = required (never two on one node; a pod stays Pending when
+# no node is free), soft = preferred, "" = no anti-affinity.
+# Only applies with sentinel.enabled (standalone has a single pod).
 podAntiAffinity:
   redis: hard
   sentinel: soft
 
-# PodDisruptionBudget (maxUnavailable: 1) para los redis y los sentinels, para
-# que un drain no se lleve dos a la vez. Solo con sentinel.enabled.
+# PodDisruptionBudget (maxUnavailable: 1) for the redis and sentinel pods, so a
+# drain cannot take two at once. Only with sentinel.enabled.
 pdb:
   enabled: true

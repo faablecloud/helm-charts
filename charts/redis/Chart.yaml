@@ -5,7 +5,7 @@ type: application
 version: 0.5.0
 appVersion: "7"
 home: https://faablecloud.github.io/helm-charts
-icon: https://faable.com/logo/Emblem.png
+icon: https://faable.com/assets/logo/Emblem.png
 maintainers:
   - name: boyander
 keywords:
