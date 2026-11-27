@@ -58,6 +58,14 @@ sentinel:
   # Sentinel's failover-timeout (ms). A failover that aborts is not retried
   # before 2x this, so it bounds how long a master can stay down.
   failoverTimeout: 30000
+  # Sidecar that makes each sentinel forget ghost peers (old pods: Sentinel never
+  # forgets one, and they count as voters, so enough of them block every
+  # failover election). It resets only its own sentinel, only with a healthy
+  # master and every expected peer live, after `strikes` checks in a row.
+  reaper:
+    enabled: true
+    intervalSeconds: 60
+    strikes: 3
   # StatefulSet minReadySeconds in Sentinel mode (see redis-statefulset.yaml).
   minReadySeconds: 15
   revisionHistoryLimit: 3
@@ -79,6 +87,10 @@ affinity: {}
 podAntiAffinity:
   redis: hard
   sentinel: soft
+  # Soft anti-affinity between sentinels and redis pods, so a node drain does not
+  # take the master and a sentinel at once (the case that split the sentinels'
+  # view on 2026-11-27). Set on the sentinels only; see "redis.affinity".
+  separateRedisAndSentinel: true
 
 # PodDisruptionBudget (maxUnavailable: 1) for the redis and sentinel pods, so a
 # drain cannot take two at once. Only with sentinel.enabled.

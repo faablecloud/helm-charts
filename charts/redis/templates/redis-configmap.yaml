@@ -201,13 +201,40 @@ data:
       done
     }
 
-    # No live master but live replicas = the master was restarted at the same
-    # time as the sentinels, and no sentinel remembers the replicas. Wait a
-    # little for it to reappear; then promote the most up-to-date replica
-    # ourselves. The choice is deterministic (highest offset, lowest ordinal
-    # on a tie), so sentinels starting together pick the same one, and
-    # REPLICAOF is idempotent. Never while a replica still sees a master
-    # (that would be a split brain, not a dead master).
+    # The other sentinels, through their Service. This pod is not in it until
+    # it listens (readinessProbe), so the answer always comes from a peer.
+    # A few tries: one may be restarting too.
+    peer() {
+      for _ in 1 2 3; do
+        r=$(timeout 3 redis-cli -h "$SENTINEL_SERVICE_NAME" -p 26379 "$@" 2>/dev/null | tr -d '\r')
+        [ -n "$r" ] && { echo "$r"; return; }
+        sleep 1
+      done
+    }
+
+    # No live master but live replicas: the master is down or restarting.
+    #
+    # If other sentinels are alive, they hold the state (the replicas and the
+    # config epoch) and the failover is theirs. Ask one for SENTINEL FAILOVER,
+    # which needs no election (ghost peers cannot block it) and publishes the
+    # new master with a higher epoch, so every sentinel follows it. Promoting
+    # the replica ourselves here is what split the sentinels on 2026-11-27: a
+    # drain restarted the master together with one sentinel, the new sentinel
+    # promoted another pod with REPLICAOF (no epoch), and the two survivors
+    # kept the old master — the one with the higher epoch, so every sentinel
+    # started afterwards adopted it too.
+    #
+    # Only with no sentinel answering (the master restarted together with
+    # all of them, so no one remembers the replicas), or when their failover
+    # gives no master in time, promote the most up-to-date replica ourselves.
+    # The choice is deterministic (highest offset, lowest ordinal on a tie),
+    # so sentinels starting together pick the same one, and REPLICAOF is
+    # idempotent. Never while a replica still sees a master (that would be a
+    # split brain, not a dead master).
+    SENTINEL_SERVICE_NAME={{ .Release.Name }}-redis-sentinel
+    FAILOVER_WAIT={{ div .Values.sentinel.failoverTimeout 1000 }}
+    FORCED=""
+    ASKED=0
     DEADLINE=$(( $(date +%s) + {{ .Values.sentinel.promoteAfterSeconds }} ))
     while :; do
       discover
@@ -219,7 +246,33 @@ data:
         echo "Ningún redis responde: arranque en frío, monitorizo $POD0_FQDN."
         break
       fi
-      if [ "$LINKS_UP" -eq 0 ] && [ "$(date +%s)" -ge "$DEADLINE" ]; then
+      if [ "$LINKS_UP" -eq 0 ] && [ "$(date +%s)" -ge "$DEADLINE" ] && [ -z "$FORCED" ]; then
+        PEER=$(peer sentinel get-master-addr-by-name "$MASTER_NAME" | head -1)
+        if [ -n "$PEER" ]; then
+          r=$(peer sentinel failover "$MASTER_NAME" | head -1)
+          echo "Sentinels vivos señalan $PEER, caído: SENTINEL FAILOVER -> ${r:-sin respuesta}."
+          FORCED=$(date +%s)
+          case "$r" in
+            *NOGOODSLAVE*) FORCED=0 ;;
+          esac
+        else
+          FORCED=0
+        fi
+      fi
+      if [ -n "$FORCED" ] && [ "$FORCED" -gt 0 ] && [ $(( $(date +%s) - FORCED )) -lt "$FAILOVER_WAIT" ]; then
+        echo "Esperando a que Sentinel promueva una réplica..."
+        sleep 2
+        continue
+      fi
+      if [ -n "$FORCED" ] && [ "$FORCED" -gt 0 ]; then
+        ASKED=$((ASKED + 1))
+        echo "El failover de Sentinel no ha dado maestro en ${FAILOVER_WAIT}s (intento $ASKED)."
+        # Once more before taking over: a failover can abort on a transient
+        # error and Sentinel does not retry it before 2 x failover-timeout.
+        if [ "$ASKED" -lt 2 ]; then FORCED=""; continue; fi
+        FORCED=0
+      fi
+      if [ "$FORCED" = 0 ] && [ "$LINKS_UP" -eq 0 ]; then
         echo "Ningún maestro vivo tras {{ .Values.sentinel.promoteAfterSeconds }}s: promuevo $CAND (offset $CAND_OFF)."
         rcli "$CAND" replicaof no one >/dev/null
         for r in $REPLICA_HOSTS; do
@@ -268,4 +321,46 @@ data:
 
     echo "Iniciando Redis en modo SENTINEL (maestro $TARGET)..."
     exec redis-server /tmp/sentinel.conf --sentinel --protected-mode no
+
+  # Sidecar of every sentinel. Sentinel never forgets a peer, and a sentinel
+  # pod comes back with a new IP and run id, so each restart leaves a ghost
+  # `s_down` entry in the survivors. Ghosts count as voters: with two of them
+  # a failover needs the vote of all three live sentinels, and on 2026-11-27
+  # every one aborted with `failover-abort-not-elected`. This resets ONLY its
+  # own sentinel (Sentinel's documented way to forget a peer), and only when
+  # the reset is harmless: the master is healthy, every expected peer is live
+  # (so the reset rediscovers all of them in seconds) and the ghost has been
+  # there for `strikes` checks in a row.
+  sentinel-reaper.sh: |
+    #!/bin/sh
+    MASTER_NAME=$REDIS_SENTINEL_MASTER_NAME
+    EXPECTED=$(({{ .Values.sentinel.replicaCount }} - 1))
+    INTERVAL={{ .Values.sentinel.reaper.intervalSeconds }}
+    STRIKES={{ .Values.sentinel.reaper.strikes }}
+
+    s() { timeout 3 redis-cli -p 26379 "$@" 2>/dev/null | tr -d '\r'; }
+    # Value of a field in a flat `key\nvalue\n...` reply.
+    field() { awk -v k="$1" 'p { print; exit } $0 == k { p = 1 }'; }
+
+    # Random start, so sentinels restarted together do not reset together.
+    sleep $(( INTERVAL + $(od -An -N2 -tu2 /dev/urandom | tr -d ' ') % INTERVAL ))
+    n=0
+    while :; do
+      flags=$(s sentinel master "$MASTER_NAME" | field flags)
+      slaves=$(s sentinel master "$MASTER_NAME" | field num-slaves)
+      peers=$(s sentinel sentinels "$MASTER_NAME" | awk 'p { print; p = 0 } $0 == "flags" { p = 1 }')
+      ghosts=$(echo "$peers" | grep -c 's_down')
+      live=$(echo "$peers" | grep -c -v -e 's_down' -e '^$')
+      if [ "$flags" = master ] && [ "${slaves:-0}" -ge 1 ] && [ "$ghosts" -gt 0 ] && [ "$live" -ge "$EXPECTED" ]; then
+        n=$((n + 1))
+        if [ "$n" -ge "$STRIKES" ]; then
+          echo "$(date -u +%FT%TZ) $ghosts sentinel(s) caído(s) desde hace $n comprobaciones, $live vivos: SENTINEL RESET $(s sentinel reset "$MASTER_NAME")"
+          n=0
+          sleep "$INTERVAL"
+        fi
+      else
+        n=0
+      fi
+      sleep "$INTERVAL"
+    done
 {{- end -}}

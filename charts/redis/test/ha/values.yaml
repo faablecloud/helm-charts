@@ -3,6 +3,10 @@
 # cache of deploy-prod on 2026-09-23.
 sentinel:
   enabled: true
+  # Faster ghost reaping than production (60 s x 3) so a scenario sees it.
+  reaper:
+    intervalSeconds: 20
+    strikes: 3
 persistence:
   enabled: false
 auth:

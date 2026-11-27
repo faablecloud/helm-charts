@@ -18,19 +18,40 @@ killing the real master.
 
 {{/*
 Pod affinity: `.Values.affinity` (e.g. anti control-plane) plus a podAntiAffinity
-by hostname against the pods of the same component.
-`include "redis.affinity" (list $ "<app.kubernetes.io/name>" "<hard|soft|''>")`.
+by hostname against the pods of the same component and, optionally, a softer
+one against the pods of another component.
+`include "redis.affinity" (list $ "<app.kubernetes.io/name>" "<hard|soft|''>" ["<other name>"])`.
+The optional fourth item only applies with `podAntiAffinity.separateRedisAndSentinel`:
+a drain that takes the master and a sentinel at once is the hard case for a
+failover (see sentinel.sh). Only the sentinels carry it: the scheduler also
+scores the preferred terms of the pods already on a node, so a redis pod avoids
+a sentinel's node too, and the StatefulSet does not roll for it.
 */}}
 {{- define "redis.affinity" -}}
 {{- $root := index . 0 -}}
 {{- $name := index . 1 -}}
 {{- $mode := index . 2 | default "" -}}
+{{- $other := "" -}}
+{{- if gt (len .) 3 -}}{{- $other = index . 3 | default "" -}}{{- end -}}
 {{- $aff := deepCopy ($root.Values.affinity | default dict) -}}
-{{- $term := dict "labelSelector" (dict "matchLabels" (dict "app.kubernetes.io/name" $name "app.kubernetes.io/instance" $root.Release.Name)) "topologyKey" "kubernetes.io/hostname" -}}
+{{- $sel := dict "app.kubernetes.io/name" $name "app.kubernetes.io/instance" $root.Release.Name -}}
+{{- $term := dict "labelSelector" (dict "matchLabels" $sel) "topologyKey" "kubernetes.io/hostname" -}}
+{{- $paa := dict -}}
+{{- $preferred := list -}}
 {{- if eq $mode "hard" -}}
-{{- $_ := set $aff "podAntiAffinity" (dict "requiredDuringSchedulingIgnoredDuringExecution" (list $term)) -}}
+{{- $_ := set $paa "requiredDuringSchedulingIgnoredDuringExecution" (list $term) -}}
 {{- else if eq $mode "soft" -}}
-{{- $_ := set $aff "podAntiAffinity" (dict "preferredDuringSchedulingIgnoredDuringExecution" (list (dict "weight" 100 "podAffinityTerm" $term))) -}}
+{{- $preferred = append $preferred (dict "weight" 100 "podAffinityTerm" $term) -}}
+{{- end -}}
+{{- if and $other $root.Values.podAntiAffinity.separateRedisAndSentinel -}}
+{{- $otherTerm := dict "labelSelector" (dict "matchLabels" (dict "app.kubernetes.io/name" $other "app.kubernetes.io/instance" $root.Release.Name)) "topologyKey" "kubernetes.io/hostname" -}}
+{{- $preferred = append $preferred (dict "weight" 50 "podAffinityTerm" $otherTerm) -}}
+{{- end -}}
+{{- if $preferred -}}
+{{- $_ := set $paa "preferredDuringSchedulingIgnoredDuringExecution" $preferred -}}
+{{- end -}}
+{{- if $paa -}}
+{{- $_ := set $aff "podAntiAffinity" $paa -}}
 {{- end -}}
 {{- if $aff -}}
 affinity:
