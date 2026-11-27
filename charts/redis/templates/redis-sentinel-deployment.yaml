@@ -24,12 +24,14 @@ spec:
         app.kubernetes.io/name: redis-sentinel
         app.kubernetes.io/instance: {{ .Release.Name }}
       annotations:
+        # `kubectl exec`/`logs` without -c go to the sentinel, not the reaper.
+        kubectl.kubernetes.io/default-container: sentinel
         # Roll the sentinels when sentinel.conf / sentinel.sh change — and
         # ONLY then: a redis.conf / redis.sh edit must not take the whole
         # quorum down while the StatefulSet is restarting the master.
-        checksum/config: {{ include "redis.checksum" (list $ "sentinel.conf" "sentinel.sh") }}
+        checksum/config: {{ include "redis.checksum" (list $ "sentinel.conf" "sentinel.sh" "sentinel-reaper.sh") }}
     spec:
-      {{- include "redis.affinity" (list $ "redis-sentinel" .Values.podAntiAffinity.sentinel) | nindent 6 }}
+      {{- include "redis.affinity" (list $ "redis-sentinel" .Values.podAntiAffinity.sentinel "redis") | nindent 6 }}
       containers:
         - name: sentinel
           image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
@@ -45,13 +47,14 @@ spec:
           volumeMounts:
             - name: conf
               mountPath: /conf
-          # sentinel.sh may wait `sentinel.promoteAfterSeconds` (plus DNS) for
-          # the master before it listens.
+          # sentinel.sh may wait `sentinel.promoteAfterSeconds`, then up to two
+          # forced failovers of `failoverTimeout` each (plus peer lookups and
+          # DNS) for the master before it listens.
           startupProbe:
             tcpSocket:
               port: sentinel
             periodSeconds: 5
-            failureThreshold: {{ add 12 (div .Values.sentinel.promoteAfterSeconds 5) }}
+            failureThreshold: {{ add 12 (div (add .Values.sentinel.promoteAfterSeconds (div (mul 2 .Values.sentinel.failoverTimeout) 1000) 20) 5) }}
           livenessProbe:
             tcpSocket:
               port: sentinel
@@ -66,6 +69,24 @@ spec:
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
+        {{- if .Values.sentinel.reaper.enabled }}
+        # Forgets ghost sentinels (see sentinel-reaper.sh in the ConfigMap).
+        - name: reaper
+          image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
+          command: ["sh", "/conf/sentinel-reaper.sh"]
+          env:
+            - name: REDIS_SENTINEL_MASTER_NAME
+              value: {{ .Values.sentinel.masterName | quote }}
+          volumeMounts:
+            - name: conf
+              mountPath: /conf
+          resources:
+            requests:
+              cpu: 5m
+              memory: 8Mi
+            limits:
+              memory: 32Mi
+        {{- end }}
       volumes:
         - name: conf
           configMap:

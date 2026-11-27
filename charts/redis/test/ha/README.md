@@ -24,6 +24,7 @@ release.**
 | `setup.sh [VERSION\|local] [KEYS]` | Installs a published `VERSION` (or the local chart), moves the master to the **last** pod (the first one a rollout restarts, which is the hard case), seeds `KEYS` keys (default 1000) and starts the probe |
 | `upgrade.sh LABEL [helm args]` | `helm upgrade` to the local chart, waits for the rollouts and measures |
 | `kill-master.sh [ROUNDS]` | Deletes the master pod `ROUNDS` times (default 3) and measures each round |
+| `kill-master-and-sentinel.sh [ROUNDS]` | Deletes the master **and** one sentinel at once `ROUNDS` times (default 2), what a node drain does when both live on that node. Measures, then waits until every sentinel names the real master with no ghost peers |
 | `cold-start.sh` | Deletes every redis pod at once (sentinels stay up) and measures |
 | `teardown.sh` | Deletes the namespace |
 
@@ -41,6 +42,7 @@ helm will revert them, and that revert is also a config change.
 ./setup.sh 0.4.1 1000                       # or the version currently in production
 ./upgrade.sh to-local                       # the transition you are about to ship
 ./kill-master.sh 3
+./kill-master-and-sentinel.sh 2
 ./upgrade.sh redis-side    --set maxmemory=200mb
 ./upgrade.sh sentinel-side --set maxmemory=200mb --set sentinel.downAfterMilliseconds=9000
 ./cold-start.sh
@@ -56,9 +58,16 @@ helm will revert them, and that revert is also a config change.
 | `redis-side` | one window of ~11 s | unchanged | sentinel pods **not** restarted |
 | `sentinel-side` | ~4-5 s, only the probe's lookups (`m=none`); clients already connected are unaffected | unchanged | redis pods **not** restarted |
 | `cold-start` | ~50 s | drops to 1 (expected without persistence) | converges to one master and two `up` replicas, with no deadlock |
+| `kill-master-and-sentinel` (0.6.0, 2026-11-27 on poz1), each round | ~6-9 s | unchanged | every sentinel names the real master with the same new epoch, `ghosts=0` within ~60 s (reaper log: `SENTINEL RESET`) |
+| `SENTINELS=2 kill-master-and-sentinel` (0.6.0) | ~6-15 s | unchanged | when the survivor cannot fail over alone, a new sentinel logs `SENTINEL FAILOVER -> OK` and does **not** promote by itself |
 
 For comparison, 0.4.1 left ~90 s without a master on every config change and, without
 persistence, came back with an empty dataset.
+
+On 0.5.0 the same `kill-master-and-sentinel.sh 3` ended split on the third round: ghosts
+piled up (1, 2, 3 per sentinel), the survivors lost the majority (`NOQUORUM`,
+`-failover-abort-not-elected`), the new sentinel promoted a replica by itself, and the probe
+flapped between two masters (124 of 173 writes failed), never converging.
 
 ## What a failure usually means
 
@@ -68,6 +77,11 @@ persistence, came back with an empty dataset.
 - **`+fix-slave-config` every second before the failover**: the old master's FQDN resolves
   to its new pod while Sentinel still holds the old IP. The headless Service must keep
   `publishNotReadyAddresses: false`.
+- **Sentinels name different masters**: someone promoted a replica outside Sentinel (no
+  epoch). Look for `promuevo` in the sentinel logs: it must only appear on a cold start,
+  never while another sentinel was alive.
+- **`ghosts` stays above 0**: the reaper needs a healthy master and every expected peer
+  live; read `kubectl logs <sentinel pod> -c reaper`.
 - **DBSIZE drops in any scenario other than `cold-start`**: a pod started as an empty
   master. Read the first lines of each redis pod's log; `redis.sh` states why it chose
   its role.

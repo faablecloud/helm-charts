@@ -54,3 +54,24 @@ measure() {
   done | sort -u
   status
 }
+
+# sentinels: what every sentinel believes, one line each, plus the real master.
+# All of them must name the same master as master_pod, with no s_down peers.
+sentinels() {
+  local s m e peers
+  echo "  real master: $(master_pod)"
+  for s in $(k get pods -l "app.kubernetes.io/name=redis-sentinel,app.kubernetes.io/instance=$REL" -o name | sed 's#pod/##'); do
+    m=$(k exec "$s" -c sentinel -- redis-cli -p 26379 sentinel get-master-addr-by-name mymaster | head -1 | cut -d. -f1)
+    e=$(k exec "$s" -c sentinel -- redis-cli -p 26379 sentinel master mymaster | paste -d= - - | grep -E '^config-epoch=' | cut -d= -f2)
+    peers=$(k exec "$s" -c sentinel -- redis-cli -p 26379 sentinel sentinels mymaster | awk 'p { print; p = 0 } $0 == "flags" { p = 1 }')
+    printf '  %-40s master=%-10s epoch=%-4s peers=%s ghosts=%s\n' "$s" "$m" "$e" \
+      "$(echo "$peers" | grep -c .)" "$(echo "$peers" | grep -c s_down)"
+  done
+}
+
+# converged: 0 when every sentinel names master_pod and none has a ghost peer.
+converged() {
+  local real; real=$(master_pod)
+  [ -n "$real" ] || return 1
+  sentinels | awk -v r="$real" 'NR > 1 { if ($2 != "master=" r || $5 != "ghosts=0") bad = 1 } END { exit bad }'
+}
